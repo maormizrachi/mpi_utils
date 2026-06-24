@@ -3,8 +3,8 @@ project(mpi_utils LANGUAGES CXX)
 
 add_library(mpi_utils INTERFACE)
 target_include_directories(mpi_utils INTERFACE
-    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-    $<INSTALL_INTERFACE:include>
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
+    $<INSTALL_INTERFACE:>
 )
 target_compile_features(mpi_utils INTERFACE cxx_std_17)
 
