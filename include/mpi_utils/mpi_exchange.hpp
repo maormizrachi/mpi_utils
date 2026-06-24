@@ -1,0 +1,99 @@
+#ifndef MPI_UTILS_MPI_EXCHANGE_HPP
+#define MPI_UTILS_MPI_EXCHANGE_HPP
+
+#include <algorithm>
+#include <cassert>
+#include <vector>
+#include <mpi.h>
+#include "Serializer.hpp"
+#include "MpiUtilsError.hpp"
+
+#define MPI_EXCHANGE_TAG 5
+
+template<typename T, typename Index_T = size_t>
+std::vector<std::vector<T>> MPI_exchange_data_indexed(const std::vector<rank_t> &correspondents, const std::vector<T> &data, const std::vector<std::vector<Index_T>> &indices = std::vector<std::vector<Index_T>>(), const size_t &extent = 1)
+{
+	std::vector<MPI_Request> req(correspondents.size());
+	std::vector<Serializer> senders(correspondents.size());
+	for(size_t i = 0; i < correspondents.size(); ++i)
+	{
+		senders[i].insert_all_indexed(data, indices[i], extent);
+		MPI_Isend((senders[i].size() > 0)? senders[i].getData() : NULL, senders[i].size(), MPI_CHAR, correspondents[i], MPI_EXCHANGE_TAG, MPI_COMM_WORLD, &req[i]);
+	}
+
+	std::vector<Serializer> receivers(correspondents.size());
+	for(size_t i = 0; i < correspondents.size(); ++i)
+	{
+		MPI_Status status;
+		MPI_Probe(MPI_ANY_SOURCE, MPI_EXCHANGE_TAG, MPI_COMM_WORLD, &status);
+		int count;
+		MPI_Get_count(&status, MPI_CHAR, &count);
+		size_t location = std::distance(correspondents.begin(), std::find(correspondents.begin(), correspondents.end(), status.MPI_SOURCE));
+		if(location >= correspondents.size())
+		{
+			MpiUtilsError eo("Bad location in mpi exchange");
+			eo.addEntry("Type", typeid(T).name());
+			eo.addEntry("Location (Index)", location);
+			eo.addEntry("Correspondents.size()", correspondents.size());
+			throw eo;
+		}
+		receivers[location].resize(count);
+		MPI_Recv(receivers[location].getData(), count, MPI_CHAR, status.MPI_SOURCE, status.MPI_TAG, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+	}
+	std::vector<std::vector<T>> result(correspondents.size());
+	for(size_t i = 0; i < correspondents.size(); ++i)
+	{
+		receivers[i].extract_all(result[i]);
+	}
+	if(not req.empty())
+	{
+		MPI_Waitall(static_cast<int>(correspondents.size()), &req[0], MPI_STATUSES_IGNORE);
+	}
+	MPI_Barrier(MPI_COMM_WORLD);
+	return result;
+}
+
+template<typename T>
+std::vector<std::vector<T>> MPI_exchange_data(const std::vector<rank_t>& correspondents, const std::vector<std::vector<T>>& data)
+{
+	std::vector<MPI_Request> req(correspondents.size());
+	std::vector<Serializer> senders(correspondents.size());
+	for(size_t i = 0; i < correspondents.size(); ++i)
+	{
+		senders[i].insert_all(data[i]);
+		MPI_Isend((senders[i].size() > 0)? senders[i].getData() : NULL, senders[i].size(), MPI_CHAR, correspondents[i], MPI_EXCHANGE_TAG, MPI_COMM_WORLD, &req[i]);
+	}
+
+	std::vector<Serializer> receivers(correspondents.size());
+	for(size_t i = 0; i < correspondents.size(); ++i)
+	{
+		MPI_Status status;
+		MPI_Probe(MPI_ANY_SOURCE, MPI_EXCHANGE_TAG, MPI_COMM_WORLD, &status);
+		int count;
+		MPI_Get_count(&status, MPI_CHAR, &count);
+		size_t location = std::distance(correspondents.begin(), std::find(correspondents.begin(), correspondents.end(), status.MPI_SOURCE));
+		if(location >= correspondents.size())
+		{
+			MpiUtilsError eo("Bad location in mpi exchange");
+			eo.addEntry("Type", typeid(T).name());
+			eo.addEntry("Location (Index)", location);
+			eo.addEntry("Correspondents.size()", correspondents.size());
+			throw eo;
+		}
+		receivers[location].resize(count);
+		MPI_Recv(receivers[location].getData(), count, MPI_CHAR, status.MPI_SOURCE, status.MPI_TAG, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+	}
+	std::vector<std::vector<T>> result(correspondents.size());
+	for(size_t i = 0; i < correspondents.size(); ++i)
+	{
+		receivers[i].extract_all(result[i]);
+	}
+	if(not req.empty())
+	{
+		MPI_Waitall(static_cast<int>(correspondents.size()), &req[0], MPI_STATUSES_IGNORE);
+	}
+	MPI_Barrier(MPI_COMM_WORLD);
+	return result;
+}
+
+#endif // MPI_UTILS_MPI_EXCHANGE_HPP
