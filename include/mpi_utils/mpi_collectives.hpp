@@ -4,7 +4,7 @@
 #include <cassert>
 #include <vector>
 #include <mpi.h>
-#include "Serializer.hpp"
+#include "serialize/Serializer.hpp"
 
 template<typename T, template<typename...> class Container, typename... Ts>
 std::vector<std::vector<T>> MPI_All_cast_by_ranks(const Container<T, Ts...> &data, const MPI_Comm &comm = MPI_COMM_WORLD)

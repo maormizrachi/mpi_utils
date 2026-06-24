@@ -12,7 +12,7 @@
 #include <utility>
 #include <vector>
 #include <mpi.h>
-#include "Serializer.hpp"
+#include "serialize/Serializer.hpp"
 #include "MPI_complex_dtype.hpp"
 #include "MpiUtilsError.hpp"
 #include "mpi_exchange.hpp"

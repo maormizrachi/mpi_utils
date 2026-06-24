@@ -5,7 +5,7 @@
 #include <cassert>
 #include <vector>
 #include <mpi.h>
-#include "Serializer.hpp"
+#include "serialize/Serializer.hpp"
 #include "MpiUtilsError.hpp"
 
 #define MPI_EXCHANGE_TAG 5

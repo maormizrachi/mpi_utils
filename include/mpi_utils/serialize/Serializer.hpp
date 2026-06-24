@@ -11,8 +11,8 @@
 #include <string>
 
 #include "Serializable.hpp"
-#include "MpiUtilsError.hpp"
-#include "compiler.h"
+#include "../MpiUtilsError.hpp"
+#include "../compiler.h"
 
 class Serializer
 {

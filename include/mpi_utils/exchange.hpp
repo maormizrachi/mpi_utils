@@ -3,7 +3,7 @@
 
 #include <mpi.h>
 #include <functional>
-#include "Serializer.hpp"
+#include "serialize/Serializer.hpp"
 #include "mpi_commands.hpp"
 
 template<typename T>
