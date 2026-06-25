@@ -13,6 +13,7 @@ std::vector<std::vector<T>> MPI_All_cast_by_ranks(const Container<T, Ts...> &dat
     MPI_Comm_size(comm, &size);
 
     Serializer send;
+    send.reset();
     int count = static_cast<int>(send.insert_all(data));
     std::vector<int> recvCounts(size, 0);
     MPI_Allgather(&count, 1, MPI_INT, recvCounts.data(), 1, MPI_INT, comm);
@@ -31,6 +32,7 @@ std::vector<std::vector<T>> MPI_All_cast_by_ranks(const Container<T, Ts...> &dat
     std::vector<int> sendDisplacements(size, 0);
     std::vector<int> sendCounts(size, count);
     Serializer recv;
+    recv.reset();
     recv.resize(totalToReceive);
     MPI_Alltoallv(send.getData(), sendCounts.data(), sendDisplacements.data(), MPI_BYTE,
                     recv.getData(), recvCounts.data(), recvDisplacements.data(), MPI_BYTE, comm);
@@ -63,6 +65,7 @@ T MPI_Bcast_serializable(const T &data, rank_t owner, const MPI_Comm &comm = MPI
     MPI_Comm_rank(comm, &rank);
 
     Serializer buf;
+    buf.reset();
     size_t sizeSent = 0;
     if(rank == owner)
     {
@@ -94,6 +97,7 @@ std::vector<T> MPI_Gatherv_serializable(const Container<T, Ts...> &data, rank_t 
         return data;
     }
     Serializer send;
+    send.reset();
     int bytes = static_cast<int>(send.insert_all(data));
 
     if(rank == root)
@@ -111,6 +115,7 @@ std::vector<T> MPI_Gatherv_serializable(const Container<T, Ts...> &data, rank_t 
             }
         }
         Serializer recv;
+        recv.reset();
         recv.resize(totalSize);
         MPI_Gatherv(send.getData(), bytes, MPI_BYTE, recv.getData(), toRecvBytes.data(), toRecvDisplacements.data(), MPI_BYTE, root, comm);
         std::vector<T> toReturn;
@@ -136,6 +141,8 @@ std::vector<T> MPI_Spread(const Container<T, Ts...> &data, rank_t root, const MP
 
 	Serializer send;
 	Serializer recv;
+	send.reset();
+	recv.reset();
 	int mySize;
 	if(rank == root)
 	{
