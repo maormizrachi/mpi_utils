@@ -1,13 +1,13 @@
 #ifndef MPI_UTILS_SERIALIZER_HPP
 #define MPI_UTILS_SERIALIZER_HPP
 
+#include <cassert>
 #include <iostream>
 #include <array>
 #include <vector>
 #include <memory>
 #include <limits>
 #include <cstring>
-#include <cassert>
 #include <string>
 
 #include "Serializable.hpp"

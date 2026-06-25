@@ -1,8 +1,8 @@
 #ifndef MPI_UTILS_MPI_ALLTOALL_HPP
 #define MPI_UTILS_MPI_ALLTOALL_HPP
 
-#include <algorithm>
 #include <cassert>
+#include <algorithm>
 #include <cstring>
 #include <functional>
 #include <limits>
