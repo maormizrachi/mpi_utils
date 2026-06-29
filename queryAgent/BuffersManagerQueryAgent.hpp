@@ -2,7 +2,6 @@
 #define BUFFERS_MANAGER_QUERY_AGENT_HPP
 
 #include <limits>
-#ifdef RICH_MPI
 
 #include <algorithm>
 #include <cmath>
@@ -20,9 +19,8 @@
 
 #include "QueryAgent.hpp"
 #include <mpi_utils/serialize/Serializer.hpp>
-#include "misc/universal_error.hpp"
-#include "utils/buffersManager/BuffersManager.hpp"
-#include "utils/amountManager/AmountManager.hpp"
+#include <mpi_utils/BuffersManager.hpp>
+#include <mpi_utils/AmountManager.hpp>
 
 #define TAG_REQUEST 200
 #define TAG_RESPONSE 201
@@ -334,6 +332,5 @@ QueryBatchInfo<QueryData, AnswerType> BuffersManagerQueryAgent<QueryData, Answer
     return queriesBatch;
 }
 
-#endif // RICH_MPI
 
 #endif // BUFFERS_MANAGER_QUERY_AGENT_HPP

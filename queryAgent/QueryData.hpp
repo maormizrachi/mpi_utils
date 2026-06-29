@@ -8,15 +8,11 @@
 #include <chrono>
 #endif // TIMING
 
-#ifdef RICH_MPI
 #include <mpi_utils/serialize/Serializer.hpp>
-#endif // RICH_MPI
 
 template<typename QueryData>
 struct SubQueryData
-                #ifdef RICH_MPI
                     : public Serializable
-                #endif // RICH_MPI
 {
     size_t parent_id;
     QueryData data;
@@ -28,7 +24,6 @@ struct SubQueryData
 
     SubQueryData(): data(QueryData()), parent_id(0){};
 
-    #ifdef RICH_MPI
         virtual size_t load(const Serializer *serializer, size_t byteOffset) override
         {
             size_t bytes = 0;
@@ -44,7 +39,6 @@ struct SubQueryData
             bytes += this->data.dump(serializer);
             return bytes;
         }
-    #endif // RICH_MPI
 };
 
 template<typename QueryData, typename AnswerType>

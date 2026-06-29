@@ -1,7 +1,6 @@
 #ifndef BUSY_WAIT_QUERY_AGENT_HPP
 #define BUSY_WAIT_QUERY_AGENT_HPP
 
-#ifdef RICH_MPI
 
 #include <algorithm>
 #include <cmath>
@@ -19,7 +18,7 @@
 
 #include "QueryAgent.hpp"
 #include <mpi_utils/serialize/Serializer.hpp>
-#include "misc/universal_error.hpp"
+#include <mpi_utils/MpiUtilsError.hpp>
 
 #define TAG_REQUEST 200
 #define TAG_RESPONSE 201
@@ -111,7 +110,7 @@ void BusyWaitQueryAgent<QueryData, AnswerType>::receiveQueries(_queryBatchInfo &
         bytes += serializer.extract(id, bytes);
         if(id < 0 or static_cast<size_t>(id) >= queries.size())
         {
-            UniversalError eo("BusyWaitQueryAgent::receiveQueries, id of answered query is illegal");
+            MpiUtilsError eo("BusyWaitQueryAgent::receiveQueries, id of answered query is illegal");
             eo.addEntry("Id", id);
             eo.addEntry("Expected range", "0-" + std::to_string(queries.size()));
             throw eo;
@@ -256,7 +255,7 @@ void BusyWaitQueryAgent<QueryData, AnswerType>::flushBuffer(int _rank)
 {
     if((_rank < 0) or (_rank >= this->size))
     {
-        UniversalError eo("BusyWaitQueryAgent::flushBuffer: invalid rank buffer flush");
+        MpiUtilsError eo("BusyWaitQueryAgent::flushBuffer: invalid rank buffer flush");
         eo.addEntry("Rank", _rank);
         throw eo;
     }
@@ -377,7 +376,7 @@ QueryBatchInfo<QueryData, AnswerType> BusyWaitQueryAgent<QueryData, AnswerType>:
                     this->finishedReceived += this->checkForFinishMessages();
                     break;
                 default:
-                    UniversalError eo("Received unrecognized tag in BusyWaitQueryAgent");
+                    MpiUtilsError eo("Received unrecognized tag in BusyWaitQueryAgent");
                     eo.addEntry("Tag", status.MPI_TAG);
                     eo.addEntry("My rank", this->rank);
                     eo.addEntry("From whom", status.MPI_SOURCE);
@@ -425,6 +424,5 @@ QueryBatchInfo<QueryData, AnswerType> BusyWaitQueryAgent<QueryData, AnswerType>:
     return queriesBatch;
 }
 
-#endif // RICH_MPI
 
 #endif // BUSY_WAIT_QUERY_AGENT_HPP

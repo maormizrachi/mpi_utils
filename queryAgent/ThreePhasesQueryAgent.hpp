@@ -1,17 +1,13 @@
 #ifndef THREE_PHASES_QUERY_AGENT_HPP
 #define THREE_PHASES_QUERY_AGENT_HPP
 
-#ifdef RICH_MPI
-#include "mpi/mpi_commands.hpp"
+#include <mpi_utils/mpi_commands.hpp>
 #include <mpi_utils/serialize/Serializer.hpp>
-#endif // RICH_MPI
 #include "QueryAgent.hpp"
 
 template<typename QueryData, typename AnswerType>
 struct SubQueryAnswer 
-                    #ifdef RICH_MPI
                         : public Serializable
-                    #endif // RICH_MPI
 {
 public:
     SubQueryData<QueryData> query;
@@ -24,7 +20,6 @@ public:
 
     SubQueryAnswer(): SubQueryAnswer(SubQueryData<QueryData>(), 0, std::vector<AnswerType>()){};
 
-    #ifdef RICH_MPI
         size_t dump(Serializer *serializer) const override
         {
             size_t bytes = 0;
@@ -40,7 +35,6 @@ public:
             bytes += serializer->extract(this->result, byteOffset + bytes);
             return bytes;
         }
-    #endif // RICH_MPI
 };
 
 template<typename QueryData, typename AnswerType>

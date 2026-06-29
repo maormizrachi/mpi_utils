@@ -1,10 +1,10 @@
 #ifndef THREADS_QUERY_AGENT
 #define THREADS_QUERY_AGENT
 
-#ifdef RICH_MPI
 
 #include <mpi.h>
 #include <algorithm>
+#include <mpi_utils/MpiUtilsError.hpp>
 #include <cmath>
 #include <set>
 #include <vector>
@@ -21,8 +21,6 @@
 #endif // TIMING
 
 #include "../QueryAgent.hpp"
-#include "utils/printing/print.hpp" // todo: remove
-
 #include "ThreadsQueryAgentAnswerer.hpp"
 #include "ThreadsQueryAgentSender.hpp"
 #include "ThreadsQueryAgentReceiver.hpp"
@@ -54,7 +52,7 @@ ThreadsQueryAgent<QueryData, AnswerType>::ThreadsQueryAgent(const TalkAgent<Quer
     MPI_Query_thread(&provided);
     if(provided != MPI_THREAD_MULTIPLE)
     {
-        throw UniversalError("ThreadsQueryAgent:: MPI_THREAD_MULTIPLE not provided. You should have used 'MPI_Init_thread' correctly");
+        throw MpiUtilsError("ThreadsQueryAgent:: MPI_THREAD_MULTIPLE not provided. You should have used 'MPI_Init_thread' correctly");
     }
 }
 
@@ -121,6 +119,5 @@ QueryBatchInfo<QueryData, AnswerType> ThreadsQueryAgent<QueryData, AnswerType>::
 // };
 
 
-#endif // RICH_MPI
 
 #endif // THREADS_QUERY_AGENT

@@ -1,7 +1,6 @@
 #ifndef WAIT_UNTIL_ANSWERED_QUERY_AGENT_HPP
 #define WAIT_UNTIL_ANSWERED_QUERY_AGENT_HPP
 
-#ifdef RICH_MPI
 
 #include <algorithm>
 #include <cmath>
@@ -12,6 +11,7 @@
 // set data structure:
 #include <boost/container/flat_set.hpp>
 #include <unordered_set>
+#include <mpi_utils/MpiUtilsError.hpp>
 
 #ifdef TIMING
     #include <chrono>
@@ -122,7 +122,7 @@ void WaitUntilAnsweredQueryAgent<QueryData, AnswerType>::receiveQueries(_queryBa
 
         if(id < 0 or static_cast<size_t>(id) >= queries.size())
         {
-            UniversalError eo("WaitUntilAnsweredQueryAgent::receiveQueries, id of answered query is illegal");
+            MpiUtilsError eo("WaitUntilAnsweredQueryAgent::receiveQueries, id of answered query is illegal");
             eo.addEntry("Id", id);
             eo.addEntry("Expected range", "0-" + std::to_string(queries.size()));
             eo.addEntry("Received Query", *reinterpret_cast<const QueryData*>(buffer.data()));
@@ -145,7 +145,7 @@ void WaitUntilAnsweredQueryAgent<QueryData, AnswerType>::receiveQueries(_queryBa
         {
             if(length < 0)
             {
-                UniversalError eo("In WaitUntilAnsweredQueryAgent::receiveQueries, length of query is negative");
+                MpiUtilsError eo("In WaitUntilAnsweredQueryAgent::receiveQueries, length of query is negative");
                 eo.addEntry("Length", length);
                 throw eo;
             }
@@ -272,7 +272,7 @@ void WaitUntilAnsweredQueryAgent<QueryData, AnswerType>::flushBuffer(int _rank)
 {
     if((_rank < 0) or (_rank >= this->size))
     {
-        UniversalError eo("WaitUntilAnsweredQueryAgent::flushBuffer: invalid rank buffer flush");
+        MpiUtilsError eo("WaitUntilAnsweredQueryAgent::flushBuffer: invalid rank buffer flush");
         eo.addEntry("Rank", _rank);
         throw eo;
     }
@@ -438,6 +438,5 @@ QueryBatchInfo<QueryData, AnswerType> WaitUntilAnsweredQueryAgent<QueryData, Ans
     return queriesBatch;
 }
 
-#endif // RICH_MPI
 
 #endif // WAIT_UNTIL_ANSWERED_QUERY_AGENT_HPP
