@@ -1,6 +1,8 @@
 #ifndef MPI_UTILS_AMOUNT_MANAGER_HPP
 #define MPI_UTILS_AMOUNT_MANAGER_HPP
 
+#ifdef __WITH_MPI
+
 #include <iostream>
 #include <cassert>
 #include <mpi.h>
@@ -76,5 +78,7 @@ private:
     bool verify;
     bool done;
 };
+
+#endif // __WITH_MPI
 
 #endif // MPI_UTILS_AMOUNT_MANAGER_HPP

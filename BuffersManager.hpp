@@ -1,6 +1,8 @@
 #ifndef MPI_UTILS_BUFFERS_MANAGER_HPP
 #define MPI_UTILS_BUFFERS_MANAGER_HPP
 
+#ifdef __WITH_MPI
+
 #include <cassert>
 #include <limits>
 #include <stdexcept>
@@ -404,5 +406,7 @@ void BuffersManager<T>::HandleIncomingOutcoming(void)
     this->Receive();
     this->CleanSendRequests();
 }
+
+#endif // __WITH_MPI
 
 #endif // MPI_UTILS_BUFFERS_MANAGER_HPP

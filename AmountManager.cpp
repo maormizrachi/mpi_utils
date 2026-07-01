@@ -1,3 +1,5 @@
+#ifdef __WITH_MPI
+
 #include "AmountManager.hpp"
 
 #define INCREASE_TAG 9918
@@ -324,3 +326,5 @@ AmountManager::~AmountManager()
     CancelAndWait(this->childVerifyRequest1);
     CancelAndWait(this->childVerifyRequest2);
 }
+
+#endif // __WITH_MPI

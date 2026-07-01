@@ -382,93 +382,89 @@ std::vector<std::vector<T>> MPI_Exchange_all_to_all_serializers(std::vector<Seri
         throw eo;
     }
 
-    Serializer send;
-    std::vector<int> sendCounts(size, 0), recvCounts(size, 0);
-    std::vector<int> sendDisplacements(size, 0), recvDisplacements(size, 0);
-    std::vector<rank_t> outgoingRanks;
+    static constexpr size_t MPI_CHUNK = static_cast<size_t>(std::numeric_limits<int>::max());
 
-    size_t totalSend = 0;
+    std::vector<size_t> sendBytes(size);
+    std::vector<size_t> recvBytes(size);
+    std::vector<rank_t> outgoingRanks, incomingRanks;
+
     for(rank_t _rank = 0; _rank < size; _rank++)
     {
-        sendDisplacements[_rank] =
-            MPI_serialize_count_to_int(totalSend, "MPI_Exchange_all_to_all_serializers send displacement");
-
-        const size_t bytes = senders[_rank].size();
-        sendCounts[_rank] =
-            MPI_serialize_count_to_int(bytes, "MPI_Exchange_all_to_all_serializers send count");
-        if(bytes > 0)
-        {
-            std::memcpy(send.resize(bytes), senders[_rank].getData(), bytes);
-        }
-        totalSend += bytes;
-        MPI_serialize_count_to_int(totalSend, "MPI_Exchange_all_to_all_serializers send buffer");
-        if(bytes > 0)
-        {
+        sendBytes[_rank] = senders[_rank].size();
+        if(sendBytes[_rank] > 0)
             outgoingRanks.push_back(_rank);
-        }
-        senders[_rank].reset();
     }
 
-    MPI_Alltoall(sendCounts.data(), 1, MPI_INT, recvCounts.data(), 1, MPI_INT, comm);
-
-    size_t totalRecv = 0;
-    std::vector<rank_t> incomingRanks;
-    for(rank_t _rank = 0; _rank < size; _rank++)
     {
-        recvDisplacements[_rank] =
-            MPI_serialize_count_to_int(totalRecv, "MPI_Exchange_all_to_all_serializers receive displacement");
-        totalRecv += static_cast<size_t>(recvCounts[_rank]);
-        MPI_serialize_count_to_int(totalRecv, "MPI_Exchange_all_to_all_serializers receive buffer");
-        if(recvCounts[_rank] > 0)
+        std::vector<long long> sendLL(size), recvLL(size);
+        for(rank_t r = 0; r < size; r++)
+            sendLL[r] = static_cast<long long>(sendBytes[r]);
+        MPI_Alltoall(sendLL.data(), 1, MPI_LONG_LONG,
+                     recvLL.data(), 1, MPI_LONG_LONG, comm);
+        for(rank_t r = 0; r < size; r++)
         {
-            incomingRanks.push_back(_rank);
+            recvBytes[r] = static_cast<size_t>(recvLL[r]);
+            if(recvBytes[r] > 0)
+                incomingRanks.push_back(r);
         }
     }
 
-    Serializer recv;
-    recv.resize(totalRecv);
+    std::vector<Serializer> recvBuffers(size);
+    for(rank_t _rank : incomingRanks)
+        recvBuffers[_rank].resize(recvBytes[_rank]);
 
     std::vector<MPI_Request> requests;
-    requests.reserve(incomingRanks.size() + outgoingRanks.size());
+
+    auto chunkedIrecv = [&](rank_t _rank)
+    {
+        char *base = reinterpret_cast<char*>(recvBuffers[_rank].getData());
+        size_t remaining = recvBytes[_rank];
+        size_t offset = 0;
+        while(remaining > 0)
+        {
+            int chunk = static_cast<int>(std::min(remaining, MPI_CHUNK));
+            MPI_Request req;
+            MPI_Irecv(base + offset, chunk, MPI_BYTE, _rank,
+                      MPI_EXCHANGE_ALLTOALL_TAG, comm, &req);
+            requests.push_back(req);
+            offset += chunk;
+            remaining -= chunk;
+        }
+    };
+
+    auto chunkedIsend = [&](rank_t _rank)
+    {
+        const char *base = reinterpret_cast<const char*>(senders[_rank].getData());
+        size_t remaining = sendBytes[_rank];
+        size_t offset = 0;
+        while(remaining > 0)
+        {
+            int chunk = static_cast<int>(std::min(remaining, MPI_CHUNK));
+            MPI_Request req;
+            MPI_Isend(base + offset, chunk, MPI_BYTE, _rank,
+                      MPI_EXCHANGE_ALLTOALL_TAG, comm, &req);
+            requests.push_back(req);
+            offset += chunk;
+            remaining -= chunk;
+        }
+    };
 
     for(rank_t _rank : incomingRanks)
-    {
-        MPI_Request request;
-        MPI_Irecv(recv.getData() + recvDisplacements[_rank],
-                  recvCounts[_rank],
-                  MPI_BYTE,
-                  _rank,
-                  MPI_EXCHANGE_ALLTOALL_TAG,
-                  comm,
-                  &request);
-        requests.push_back(request);
-    }
-
+        chunkedIrecv(_rank);
     for(rank_t _rank : outgoingRanks)
-    {
-        MPI_Request request;
-        MPI_Isend(send.getData() + sendDisplacements[_rank],
-                  sendCounts[_rank],
-                  MPI_BYTE,
-                  _rank,
-                  MPI_EXCHANGE_ALLTOALL_TAG,
-                  comm,
-                  &request);
-        requests.push_back(request);
-    }
+        chunkedIsend(_rank);
 
     if(!requests.empty())
-    {
         MPI_Waitall(static_cast<int>(requests.size()), requests.data(), MPI_STATUSES_IGNORE);
-    }
+
+    for(rank_t _rank = 0; _rank < size; _rank++)
+        senders[_rank].reset();
 
     std::vector<std::vector<T>> result(size);
     for(rank_t _rank : incomingRanks)
     {
-        size_t bytesRead = recv.extract(result[_rank],
-                                        static_cast<size_t>(recvDisplacements[_rank]),
-                                        static_cast<size_t>(recvCounts[_rank]));
-        assert(bytesRead == static_cast<size_t>(recvCounts[_rank]));
+        size_t bytesRead = recvBuffers[_rank].extract(result[_rank], 0, recvBytes[_rank]);
+        assert(bytesRead == recvBytes[_rank]);
         (void)bytesRead;
     }
 
