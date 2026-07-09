@@ -12,6 +12,7 @@
 #include <utility>
 #include <vector>
 #include <mpi.h>
+#include <boost/container/flat_map.hpp>
 #include "serialize/Serializer.hpp"
 #include "MPI_complex_dtype.hpp"
 #include "MpiUtilsError.hpp"
@@ -26,6 +27,44 @@
 #endif
 #define MPI_FLAT_SPARSE_COUNT_TAG 1042
 #define MPI_FLAT_SPARSE_DATA_TAG 1043
+
+// ============================================================================
+// Serializer memory management (static buffer release policy)
+// ============================================================================
+
+namespace mpi_utils_detail {
+
+constexpr size_t SERIALIZER_SOFT_RELEASE_BYTES = 32ull * 1024ull * 1024ull;
+constexpr size_t SERIALIZER_HARD_RELEASE_BYTES = 128ull * 1024ull * 1024ull;
+constexpr size_t SERIALIZER_WASTE_FACTOR = 4;
+
+inline bool should_release_serializer(const Serializer &s)
+{
+    size_t cap = s.capacity();
+    size_t live = s.size();
+    if(cap >= SERIALIZER_HARD_RELEASE_BYTES)
+    {
+        return true;
+    }
+    if(cap >= SERIALIZER_SOFT_RELEASE_BYTES && cap > SERIALIZER_WASTE_FACTOR * std::max<size_t>(live, 1))
+    {
+        return true;
+    }
+    return false;
+}
+
+inline void release_oversized_serializers(std::vector<Serializer> &bufs)
+{
+    for(Serializer &s : bufs)
+    {
+        if(should_release_serializer(s))
+        {
+            s.release();
+        }
+    }
+}
+
+} // namespace mpi_utils_detail
 
 // ============================================================================
 // Internal helpers
@@ -138,23 +177,36 @@ std::vector<std::pair<rank_t, std::vector<T>>> MPI_Exchange_sparse_by_rank(const
 
     using ContainerType = Container<T, Ts...>;
 
+    static constexpr size_t MPI_SPARSE_CHUNK = static_cast<size_t>(std::numeric_limits<int>::max());
+
     if constexpr(MPI_has_complex_dtype<T>::value && MPI_container_has_data<ContainerType>::value)
     {
         MPI_Datatype dtype = MPI_has_complex_dtype<T>::getDatatype();
-        std::vector<int> sendCounts(size, 0), recvCounts(size, 0);
+        std::vector<size_t> sendCounts(size, 0);
         std::vector<rank_t> outgoingRanks;
 
         for(rank_t _rank = 0; _rank < size; _rank++)
         {
-            sendCounts[_rank] =
-                MPI_serialize_count_to_int(data[_rank].size(), "MPI_Exchange_sparse_by_rank native send count");
+            sendCounts[_rank] = data[_rank].size();
             if(sendCounts[_rank] > 0)
             {
                 outgoingRanks.push_back(_rank);
             }
         }
 
-        MPI_Alltoall(sendCounts.data(), 1, MPI_INT, recvCounts.data(), 1, MPI_INT, comm);
+        std::vector<size_t> recvCounts(size, 0);
+        {
+            std::vector<long long> sendLL(size), recvLL(size);
+            for(rank_t r = 0; r < size; r++)
+            {
+                sendLL[r] = static_cast<long long>(sendCounts[r]);
+            }
+            MPI_Alltoall(sendLL.data(), 1, MPI_LONG_LONG, recvLL.data(), 1, MPI_LONG_LONG, comm);
+            for(rank_t r = 0; r < size; r++)
+            {
+                recvCounts[r] = static_cast<size_t>(recvLL[r]);
+            }
+        }
 
         std::vector<rank_t> incomingRanks;
         for(rank_t _rank = 0; _rank < size; _rank++)
@@ -165,120 +217,190 @@ std::vector<std::pair<rank_t, std::vector<T>>> MPI_Exchange_sparse_by_rank(const
             }
         }
 
+        rank_t myRank;
+        MPI_Comm_rank(comm, &myRank);
+
         std::vector<std::pair<rank_t, std::vector<T>>> result;
         result.reserve(incomingRanks.size());
 
-        std::vector<MPI_Request> requests;
-        requests.reserve(incomingRanks.size() + outgoingRanks.size());
-
+        boost::container::flat_map<rank_t, size_t> resultIndex;
         for(rank_t _rank : incomingRanks)
         {
-            result.emplace_back(_rank, std::vector<T>(static_cast<size_t>(recvCounts[_rank])));
-            MPI_Request request;
-            MPI_Irecv(result.back().second.data(),
-                      recvCounts[_rank],
-                      dtype,
-                      _rank,
-                      tag,
-                      comm,
-                      &request);
-            requests.push_back(request);
+            resultIndex[_rank] = result.size();
+            result.emplace_back(_rank, std::vector<T>(recvCounts[_rank]));
         }
 
-        for(rank_t _rank : outgoingRanks)
+        if(sendCounts[myRank] > 0)
         {
-            MPI_Request request;
-            MPI_Isend(data[_rank].data(),
-                      sendCounts[_rank],
-                      dtype,
-                      _rank,
-                      tag,
-                      comm,
-                      &request);
-            requests.push_back(request);
+            std::memcpy(result[resultIndex[myRank]].second.data(),
+                        data[myRank].data(),
+                        sendCounts[myRank] * sizeof(T));
         }
 
-        if(!requests.empty())
+        for(rank_t step = 1; step < size; step++)
         {
-            MPI_Waitall(static_cast<int>(requests.size()), requests.data(), MPI_STATUSES_IGNORE);
+            rank_t sendTo   = (myRank + step) % size;
+            rank_t recvFrom = (myRank - step + size) % size;
+
+            size_t sCnt = sendCounts[sendTo];
+            size_t rCnt = recvCounts[recvFrom];
+
+            if(sCnt == 0 && rCnt == 0)
+            {
+                continue;
+            }
+
+            std::vector<MPI_Request> requests;
+
+            if(rCnt > 0)
+            {
+                T *base = result[resultIndex[recvFrom]].second.data();
+                size_t remaining = rCnt;
+                size_t offset = 0;
+                while(remaining > 0)
+                {
+                    int chunk = static_cast<int>(std::min(remaining, MPI_SPARSE_CHUNK));
+                    MPI_Request request;
+                    MPI_Irecv(base + offset, chunk, dtype, recvFrom, tag, comm, &request);
+                    requests.push_back(request);
+                    offset += chunk;
+                    remaining -= chunk;
+                }
+            }
+
+            if(sCnt > 0)
+            {
+                const T *base = data[sendTo].data();
+                size_t remaining = sCnt;
+                size_t offset = 0;
+                while(remaining > 0)
+                {
+                    int chunk = static_cast<int>(std::min(remaining, MPI_SPARSE_CHUNK));
+                    MPI_Request request;
+                    MPI_Isend(base + offset, chunk, dtype, sendTo, tag, comm, &request);
+                    requests.push_back(request);
+                    offset += chunk;
+                    remaining -= chunk;
+                }
+            }
+
+            if(!requests.empty())
+            {
+                MPI_Waitall(static_cast<int>(requests.size()), requests.data(), MPI_STATUSES_IGNORE);
+            }
         }
 
         return result;
     }
 
     Serializer send;
-    std::vector<int> sendCounts(size, 0), recvCounts(size, 0);
-    std::vector<int> sendDisplacements(size, 0), recvDisplacements(size, 0);
+    std::vector<size_t> sendBytes(size, 0);
+    std::vector<size_t> sendOffsets(size, 0);
     std::vector<rank_t> outgoingRanks;
 
     size_t totalSend = 0;
     for(rank_t _rank = 0; _rank < size; _rank++)
     {
-        sendDisplacements[_rank] =
-            MPI_serialize_count_to_int(totalSend, "MPI_Exchange_sparse_by_rank send displacement");
-
+        sendOffsets[_rank] = totalSend;
         const size_t bytes = MPI_insert_sparse_payload<T>(send, data[_rank]);
-        sendCounts[_rank] =
-            MPI_serialize_count_to_int(bytes, "MPI_Exchange_sparse_by_rank send count");
+        sendBytes[_rank] = bytes;
         totalSend += bytes;
-        MPI_serialize_count_to_int(totalSend, "MPI_Exchange_sparse_by_rank send buffer");
         if(bytes > 0)
         {
             outgoingRanks.push_back(_rank);
         }
     }
 
-    MPI_Alltoall(sendCounts.data(), 1, MPI_INT, recvCounts.data(), 1, MPI_INT, comm);
+    std::vector<size_t> recvBytes(size, 0);
+    {
+        std::vector<long long> sendLL(size), recvLL(size);
+        for(rank_t r = 0; r < size; r++)
+        {
+            sendLL[r] = static_cast<long long>(sendBytes[r]);
+        }
+        MPI_Alltoall(sendLL.data(), 1, MPI_LONG_LONG, recvLL.data(), 1, MPI_LONG_LONG, comm);
+        for(rank_t r = 0; r < size; r++)
+        {
+            recvBytes[r] = static_cast<size_t>(recvLL[r]);
+        }
+    }
 
-    size_t totalRecv = 0;
     std::vector<rank_t> incomingRanks;
     for(rank_t _rank = 0; _rank < size; _rank++)
     {
-        recvDisplacements[_rank] =
-            MPI_serialize_count_to_int(totalRecv, "MPI_Exchange_sparse_by_rank receive displacement");
-        totalRecv += static_cast<size_t>(recvCounts[_rank]);
-        MPI_serialize_count_to_int(totalRecv, "MPI_Exchange_sparse_by_rank receive buffer");
-        if(recvCounts[_rank] > 0)
+        if(recvBytes[_rank] > 0)
         {
             incomingRanks.push_back(_rank);
         }
     }
 
-    Serializer recv;
-    recv.resize(totalRecv);
+    rank_t myRank;
+    MPI_Comm_rank(comm, &myRank);
 
-    std::vector<MPI_Request> requests;
-    requests.reserve(incomingRanks.size() + outgoingRanks.size());
+    std::vector<Serializer> recvBuffers(size);
 
-    for(rank_t _rank : incomingRanks)
+    if(sendBytes[myRank] > 0)
     {
-        MPI_Request request;
-        MPI_Irecv(recv.getData() + recvDisplacements[_rank],
-                  recvCounts[_rank],
-                  MPI_BYTE,
-                  _rank,
-                  tag,
-                  comm,
-                  &request);
-        requests.push_back(request);
+        recvBuffers[myRank].resize(sendBytes[myRank]);
+        std::memcpy(recvBuffers[myRank].getData(), send.getData() + sendOffsets[myRank], sendBytes[myRank]);
     }
 
-    for(rank_t _rank : outgoingRanks)
+    for(rank_t step = 1; step < size; step++)
     {
-        MPI_Request request;
-        MPI_Isend(send.getData() + sendDisplacements[_rank],
-                  sendCounts[_rank],
-                  MPI_BYTE,
-                  _rank,
-                  tag,
-                  comm,
-                  &request);
-        requests.push_back(request);
-    }
+        rank_t sendTo   = (myRank + step) % size;
+        rank_t recvFrom = (myRank - step + size) % size;
 
-    if(!requests.empty())
-    {
-        MPI_Waitall(static_cast<int>(requests.size()), requests.data(), MPI_STATUSES_IGNORE);
+        size_t sBytes = sendBytes[sendTo];
+        size_t rBytes = recvBytes[recvFrom];
+
+        if(sBytes == 0 && rBytes == 0)
+        {
+            continue;
+        }
+
+        if(rBytes > 0)
+        {
+            recvBuffers[recvFrom].resize(rBytes);
+        }
+
+        std::vector<MPI_Request> requests;
+
+        if(rBytes > 0)
+        {
+            char *base = recvBuffers[recvFrom].getData();
+            size_t remaining = rBytes;
+            size_t offset = 0;
+            while(remaining > 0)
+            {
+                int chunk = static_cast<int>(std::min(remaining, MPI_SPARSE_CHUNK));
+                MPI_Request request;
+                MPI_Irecv(base + offset, chunk, MPI_BYTE, recvFrom, tag, comm, &request);
+                requests.push_back(request);
+                offset += chunk;
+                remaining -= chunk;
+            }
+        }
+
+        if(sBytes > 0)
+        {
+            const char *base = send.getData() + sendOffsets[sendTo];
+            size_t remaining = sBytes;
+            size_t offset = 0;
+            while(remaining > 0)
+            {
+                int chunk = static_cast<int>(std::min(remaining, MPI_SPARSE_CHUNK));
+                MPI_Request request;
+                MPI_Isend(base + offset, chunk, MPI_BYTE, sendTo, tag, comm, &request);
+                requests.push_back(request);
+                offset += chunk;
+                remaining -= chunk;
+            }
+        }
+
+        if(!requests.empty())
+        {
+            MPI_Waitall(static_cast<int>(requests.size()), requests.data(), MPI_STATUSES_IGNORE);
+        }
     }
 
     std::vector<std::pair<rank_t, std::vector<T>>> result;
@@ -286,11 +408,11 @@ std::vector<std::pair<rank_t, std::vector<T>>> MPI_Exchange_sparse_by_rank(const
     for(rank_t _rank : incomingRanks)
     {
         std::vector<T> values;
-        size_t bytesRead = MPI_extract_sparse_payload(recv,
+        size_t bytesRead = MPI_extract_sparse_payload(recvBuffers[_rank],
                                                       values,
-                                                      static_cast<size_t>(recvDisplacements[_rank]),
-                                                      static_cast<size_t>(recvCounts[_rank]));
-        assert(bytesRead == static_cast<size_t>(recvCounts[_rank]));
+                                                      0,
+                                                      recvBytes[_rank]);
+        assert(bytesRead == recvBytes[_rank]);
         (void)bytesRead;
         result.emplace_back(_rank, std::move(values));
     }
@@ -384,6 +506,13 @@ std::vector<std::vector<T>> MPI_Exchange_all_to_all_serializers(std::vector<Seri
 
     static constexpr size_t MPI_CHUNK = static_cast<size_t>(std::numeric_limits<int>::max());
 
+    static std::vector<Serializer> recvBuffers;
+    recvBuffers.resize(size);
+    for(rank_t r = 0; r < size; r++)
+    {
+        recvBuffers[r].reset();
+    }
+
     std::vector<size_t> sendBytes(size);
     std::vector<size_t> recvBytes(size);
     std::vector<rank_t> outgoingRanks, incomingRanks;
@@ -409,56 +538,79 @@ std::vector<std::vector<T>> MPI_Exchange_all_to_all_serializers(std::vector<Seri
         }
     }
 
-    std::vector<Serializer> recvBuffers(size);
-    for(rank_t _rank : incomingRanks)
-        recvBuffers[_rank].resize(recvBytes[_rank]);
+    rank_t myRank;
+    MPI_Comm_rank(comm, &myRank);
 
-    std::vector<MPI_Request> requests;
-
-    auto chunkedIrecv = [&](rank_t _rank)
+    if(sendBytes[myRank] > 0)
     {
-        char *base = reinterpret_cast<char*>(recvBuffers[_rank].getData());
-        size_t remaining = recvBytes[_rank];
-        size_t offset = 0;
-        while(remaining > 0)
-        {
-            int chunk = static_cast<int>(std::min(remaining, MPI_CHUNK));
-            MPI_Request req;
-            MPI_Irecv(base + offset, chunk, MPI_BYTE, _rank,
-                      MPI_EXCHANGE_ALLTOALL_TAG, comm, &req);
-            requests.push_back(req);
-            offset += chunk;
-            remaining -= chunk;
-        }
-    };
+        recvBuffers[myRank].resize(sendBytes[myRank]);
+        std::memcpy(recvBuffers[myRank].getData(),
+                    senders[myRank].getData(),
+                    sendBytes[myRank]);
+        senders[myRank].reset();
+    }
 
-    auto chunkedIsend = [&](rank_t _rank)
+    for(rank_t step = 1; step < size; step++)
     {
-        const char *base = reinterpret_cast<const char*>(senders[_rank].getData());
-        size_t remaining = sendBytes[_rank];
-        size_t offset = 0;
-        while(remaining > 0)
+        rank_t sendTo   = (myRank + step) % size;
+        rank_t recvFrom = (myRank - step + size) % size;
+
+        size_t sBytes = sendBytes[sendTo];
+        size_t rBytes = recvBytes[recvFrom];
+
+        if(sBytes == 0 && rBytes == 0)
         {
-            int chunk = static_cast<int>(std::min(remaining, MPI_CHUNK));
-            MPI_Request req;
-            MPI_Isend(base + offset, chunk, MPI_BYTE, _rank,
-                      MPI_EXCHANGE_ALLTOALL_TAG, comm, &req);
-            requests.push_back(req);
-            offset += chunk;
-            remaining -= chunk;
+            continue;
         }
-    };
 
-    for(rank_t _rank : incomingRanks)
-        chunkedIrecv(_rank);
-    for(rank_t _rank : outgoingRanks)
-        chunkedIsend(_rank);
+        if(rBytes > 0)
+        {
+            recvBuffers[recvFrom].resize(rBytes);
+        }
 
-    if(!requests.empty())
-        MPI_Waitall(static_cast<int>(requests.size()), requests.data(), MPI_STATUSES_IGNORE);
+        std::vector<MPI_Request> requests;
 
-    for(rank_t _rank = 0; _rank < size; _rank++)
-        senders[_rank].reset();
+        if(rBytes > 0)
+        {
+            char *base = recvBuffers[recvFrom].getData();
+            size_t remaining = rBytes;
+            size_t offset = 0;
+            while(remaining > 0)
+            {
+                int chunk = static_cast<int>(std::min(remaining, MPI_CHUNK));
+                MPI_Request req;
+                MPI_Irecv(base + offset, chunk, MPI_BYTE, recvFrom,
+                          MPI_EXCHANGE_ALLTOALL_TAG, comm, &req);
+                requests.push_back(req);
+                offset += chunk;
+                remaining -= chunk;
+            }
+        }
+
+        if(sBytes > 0)
+        {
+            const char *base = reinterpret_cast<const char*>(senders[sendTo].getData());
+            size_t remaining = sBytes;
+            size_t offset = 0;
+            while(remaining > 0)
+            {
+                int chunk = static_cast<int>(std::min(remaining, MPI_CHUNK));
+                MPI_Request req;
+                MPI_Isend(base + offset, chunk, MPI_BYTE, sendTo,
+                          MPI_EXCHANGE_ALLTOALL_TAG, comm, &req);
+                requests.push_back(req);
+                offset += chunk;
+                remaining -= chunk;
+            }
+        }
+
+        if(!requests.empty())
+        {
+            MPI_Waitall(static_cast<int>(requests.size()), requests.data(), MPI_STATUSES_IGNORE);
+        }
+
+        senders[sendTo].reset();
+    }
 
     std::vector<std::vector<T>> result(size);
     for(rank_t _rank : incomingRanks)
@@ -467,6 +619,9 @@ std::vector<std::vector<T>> MPI_Exchange_all_to_all_serializers(std::vector<Seri
         assert(bytesRead == recvBytes[_rank]);
         (void)bytesRead;
     }
+
+    mpi_utils_detail::release_oversized_serializers(senders);
+    mpi_utils_detail::release_oversized_serializers(recvBuffers);
 
     return result;
 }
