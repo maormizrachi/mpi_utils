@@ -1,6 +1,10 @@
 cmake_minimum_required(VERSION 3.14)
 project(mpi_utils LANGUAGES CXX)
 
+if(CMAKE_CXX_COMPILER_ID MATCHES "^(Intel|IntelLLVM)$")
+    add_compile_options(-fp-model precise)
+endif()
+
 add_library(mpi_utils INTERFACE)
 target_include_directories(mpi_utils INTERFACE
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
