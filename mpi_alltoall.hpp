@@ -945,6 +945,7 @@ struct FlatSparseHandle
     std::vector<MPI_Request> payloadRequests;
     std::vector<char> sendBuf;
     std::vector<char> recvBuf;
+    std::vector<std::vector<char>> peerRecvBufs;
     std::vector<int> sendCounts;
     std::vector<int> sendDisplacements;
     std::vector<int> recvCounts;
@@ -971,15 +972,27 @@ FlatSparseHandle MPI_flat_sparse_pack_and_post_counts(
     size_t totalSend = 0;
     for(int i = 0; i < degree; i++)
     {
-        h.sendCounts[i] = static_cast<int>(data[neighbors[i]].size() * NODE_SIZE);
+        size_t const valueCount = data[neighbors[i]].size();
+        if(valueCount > static_cast<size_t>(
+                std::numeric_limits<int>::max()) / NODE_SIZE)
+            throw MpiUtilsError(
+                "Flat sparse peer send exceeds MPI int byte count");
+        size_t const peerBytes = valueCount * NODE_SIZE;
+        if(totalSend > static_cast<size_t>(
+                std::numeric_limits<int>::max()) - peerBytes)
+            throw MpiUtilsError(
+                "Flat sparse cumulative send exceeds MPI int displacement");
+        h.sendCounts[i] = static_cast<int>(peerBytes);
         h.sendDisplacements[i] = static_cast<int>(totalSend);
-        totalSend += static_cast<size_t>(h.sendCounts[i]);
+        totalSend += peerBytes;
     }
 
     h.sendBuf.resize(totalSend);
     for(int i = 0; i < degree; i++)
     {
         const std::vector<T> &vec = data[neighbors[i]];
+        if(vec.empty())
+            continue;
         char *dst = h.sendBuf.data() + h.sendDisplacements[i];
         for(size_t j = 0; j < vec.size(); j++)
         {
@@ -1017,34 +1030,138 @@ inline void MPI_flat_sparse_post_payload(FlatSparseHandle &h, const MPI_Comm &co
     size_t totalRecv = 0;
     for(int i = 0; i < degree; i++)
     {
+        if(h.recvCounts[i] < 0)
+            throw MpiUtilsError(
+                "Flat sparse receive has a negative MPI byte count");
         h.recvDisplacements[i] = static_cast<int>(totalRecv);
-        totalRecv += static_cast<size_t>(h.recvCounts[i]);
+        size_t const peerBytes = static_cast<size_t>(h.recvCounts[i]);
+        if(totalRecv > static_cast<size_t>(
+                std::numeric_limits<int>::max()) - peerBytes)
+            throw MpiUtilsError(
+                "Flat sparse cumulative receive exceeds MPI int displacement");
+        totalRecv += peerBytes;
     }
     h.recvBuf.resize(totalRecv);
 
     h.payloadRequests.resize(2 * degree);
     for(int i = 0; i < degree; i++)
     {
-        MPI_Irecv(h.recvBuf.data() + h.recvDisplacements[i],
+        void *recvPtr = h.recvCounts[i] == 0 ? nullptr :
+            static_cast<void *>(h.recvBuf.data() + h.recvDisplacements[i]);
+        MPI_Irecv(recvPtr,
                   h.recvCounts[i], MPI_BYTE, h.neighbors[i],
                   MPI_FLAT_SPARSE_DATA_TAG, comm, &h.payloadRequests[i]);
     }
     for(int i = 0; i < degree; i++)
     {
-        MPI_Isend(h.sendBuf.data() + h.sendDisplacements[i],
+        const void *sendPtr = h.sendCounts[i] == 0 ? nullptr :
+            static_cast<const void *>(h.sendBuf.data() + h.sendDisplacements[i]);
+        MPI_Isend(sendPtr,
                   h.sendCounts[i], MPI_BYTE, h.neighbors[i],
                   MPI_FLAT_SPARSE_DATA_TAG, comm, &h.payloadRequests[degree + i]);
     }
 }
 
-template<typename T>
-std::vector<std::vector<T>> MPI_flat_sparse_wait(FlatSparseHandle &h)
+inline void MPI_flat_sparse_post_peer_payload(
+    FlatSparseHandle &h, const MPI_Comm &comm)
+{
+    int const degree = static_cast<int>(h.neighbors.size());
+    if(!h.countRequests.empty())
+    {
+        MPI_Waitall(static_cast<int>(h.countRequests.size()),
+                    h.countRequests.data(), MPI_STATUSES_IGNORE);
+    }
+
+    h.peerRecvBufs.clear();
+    h.peerRecvBufs.resize(static_cast<size_t>(degree));
+    for(int i = 0; i < degree; ++i)
+    {
+        if(h.recvCounts[i] < 0)
+            throw MpiUtilsError(
+                "Flat sparse peer receive has a negative MPI byte count");
+        h.peerRecvBufs[static_cast<size_t>(i)].resize(
+            static_cast<size_t>(h.recvCounts[i]));
+    }
+
+    h.payloadRequests.resize(2 * degree);
+    for(int i = 0; i < degree; ++i)
+    {
+        std::vector<char>& peer = h.peerRecvBufs[static_cast<size_t>(i)];
+        void *recvPtr = peer.empty() ? nullptr :
+            static_cast<void *>(peer.data());
+        MPI_Irecv(recvPtr, h.recvCounts[i], MPI_BYTE, h.neighbors[i],
+                  MPI_FLAT_SPARSE_DATA_TAG, comm, &h.payloadRequests[i]);
+    }
+    for(int i = 0; i < degree; ++i)
+    {
+        const void *sendPtr = h.sendCounts[i] == 0 ? nullptr :
+            static_cast<const void *>(h.sendBuf.data() + h.sendDisplacements[i]);
+        MPI_Isend(sendPtr, h.sendCounts[i], MPI_BYTE, h.neighbors[i],
+                  MPI_FLAT_SPARSE_DATA_TAG, comm,
+                  &h.payloadRequests[degree + i]);
+    }
+}
+
+inline void MPI_flat_sparse_wait_payload(FlatSparseHandle &h)
 {
     if(!h.payloadRequests.empty())
     {
         MPI_Waitall(static_cast<int>(h.payloadRequests.size()),
                     h.payloadRequests.data(), MPI_STATUSES_IGNORE);
     }
+    std::vector<MPI_Request>().swap(h.countRequests);
+    std::vector<MPI_Request>().swap(h.payloadRequests);
+    // Payload sends are complete.  Do not retain the packed send copy while
+    // the caller builds its receive-side data structure.
+    std::vector<char>().swap(h.sendBuf);
+}
+
+template<typename T, typename Visitor>
+void MPI_flat_sparse_visit_received_by_peer(
+    FlatSparseHandle &h, Visitor &&visitor)
+{
+    constexpr size_t NODE_SIZE = T::FLAT_BYTE_SIZE;
+    int const degree = static_cast<int>(h.neighbors.size());
+    if(h.peerRecvBufs.size() != static_cast<size_t>(degree))
+        throw MpiUtilsError("Flat sparse peer receive storage is incomplete");
+
+    std::vector<int> rankOrderedSlots(static_cast<size_t>(degree));
+    std::iota(rankOrderedSlots.begin(), rankOrderedSlots.end(), 0);
+    // Preserve the rank-major order of MPI_flat_sparse_wait.  Gravity tree
+    // aggregation is deterministic for a fixed insertion order.
+    std::sort(rankOrderedSlots.begin(), rankOrderedSlots.end(),
+        [&](int const left, int const right)
+        {
+            return h.neighbors[left] < h.neighbors[right];
+        });
+
+    for(int const neighborSlot : rankOrderedSlots)
+    {
+        int const byteCount = h.recvCounts[neighborSlot];
+        std::vector<char>& peer =
+            h.peerRecvBufs[static_cast<size_t>(neighborSlot)];
+        if(byteCount < 0 ||
+           static_cast<size_t>(byteCount) != peer.size() ||
+           peer.size() % NODE_SIZE != 0)
+            throw MpiUtilsError(
+                "Flat sparse peer receive byte count is not a valid payload");
+        rank_t const srcRank = h.neighbors[neighborSlot];
+        size_t const count = peer.size() / NODE_SIZE;
+        for(size_t j = 0; j < count; ++j)
+        {
+            T value;
+            value.loadFlat(peer.data() + j * NODE_SIZE);
+            visitor(srcRank, value);
+        }
+        std::vector<char>().swap(peer);
+    }
+    std::vector<std::vector<char>>().swap(h.peerRecvBufs);
+}
+
+template<typename T>
+std::vector<std::vector<T>> MPI_flat_sparse_wait(FlatSparseHandle &h)
+{
+    MPI_flat_sparse_wait_payload(h);
 
     constexpr size_t NODE_SIZE = T::FLAT_BYTE_SIZE;
     int degree = static_cast<int>(h.neighbors.size());
@@ -1066,6 +1183,8 @@ std::vector<std::vector<T>> MPI_flat_sparse_wait(FlatSparseHandle &h)
             result[srcRank][j].loadFlat(src + j * NODE_SIZE);
         }
     }
+
+    std::vector<char>().swap(h.recvBuf);
 
     return result;
 }
