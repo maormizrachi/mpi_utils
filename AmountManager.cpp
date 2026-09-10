@@ -6,6 +6,8 @@
 #define DONE_TAG 9919
 #define VERIFY_TAG 9920
 #define VERIFY_RESULT_TAG 9921
+// Upper bound on queued child messages consumed per Progress call.
+#define MAX_DRAIN_PER_PROGRESS 65536
 
 namespace
 {
@@ -110,16 +112,26 @@ void AmountManager::Progress(void)
         }
     }
 
-    MPI_Test(&this->request1, &flag, &status);
-    if(this->child1 < this->size and flag)
+    // Drain every count message that has already arrived, not just one per
+    // call. Children flush a small message each time they complete work, and
+    // Progress runs only every few transport rounds; taking a single message
+    // per call made a busy parent (rank 0 is both the tree root and, with
+    // heavy centre cells, often the slowest rank) drain its backlog at two
+    // messages per call long after transport had finished.
+    for(size_t drained = 0; this->child1 < this->size and drained < MAX_DRAIN_PER_PROGRESS; ++drained)
     {
+        MPI_Test(&this->request1, &flag, &status);
+        if(not flag)
+            break;
         this->tempNum += this->recv1;
         MPI_Irecv(&this->recv1, 1, MPI_LONG_LONG, this->child1, INCREASE_TAG, this->comm, &this->request1);
     }
 
-    MPI_Test(&this->request2, &flag, &status);
-    if(this->child2 < this->size and flag)
+    for(size_t drained = 0; this->child2 < this->size and drained < MAX_DRAIN_PER_PROGRESS; ++drained)
     {
+        MPI_Test(&this->request2, &flag, &status);
+        if(not flag)
+            break;
         this->tempNum += this->recv2;
         MPI_Irecv(&this->recv2, 1, MPI_LONG_LONG, this->child2, INCREASE_TAG, this->comm, &this->request2);
     }
