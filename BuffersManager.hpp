@@ -4,6 +4,7 @@
 #ifdef __WITH_MPI
 
 #include <cassert>
+#include <iostream>
 #include <limits>
 #include <stdexcept>
 #include <mpi.h>
@@ -84,8 +85,10 @@ template<typename T>
 BuffersManager<T>::BuffersManager(const MPI_Comm &comm, const std::function<void(const T *newValues, size_t newValuesCount, rank_t fromRank)> &receiveCallback, int tag, size_t buffersSize, size_t minSizeToDispatch, size_t minCyclesToDispatch, size_t numReceiveBuffers, const std::vector<rank_t> &neighbors)
     : comm(comm), destroyed(false), receiveCallback(receiveCallback), tag(tag), buffersSize(buffersSize), minSizeToDispatch(minSizeToDispatch), minCyclesToDispatch(minCyclesToDispatch)
 {
-    this->buffersSize += sizeof(size_t);
-    this->minSizeToDispatch += sizeof(size_t);
+    // Message header: payload bytes, then the per-destination sequence number
+    // (used to detect lost or reordered messages on the receiver).
+    this->buffersSize += 2 * sizeof(size_t);
+    this->minSizeToDispatch += 2 * sizeof(size_t);
 
     MPI_Comm_rank(comm, &this->rank_world);
     MPI_Comm_size(comm, &this->size_world);
@@ -99,8 +102,8 @@ BuffersManager<T>::BuffersManager(const MPI_Comm &comm, const std::function<void
 
     if(this->buffersSize < this->minSizeToDispatch)
     {
-        throw std::runtime_error("BuffersManager: buffersSize (" + std::to_string(this->buffersSize - sizeof(size_t))
-                                 + ") is less than minSizeToDispatch (" + std::to_string(this->minSizeToDispatch - sizeof(size_t)) + ")");
+        throw std::runtime_error("BuffersManager: buffersSize (" + std::to_string(this->buffersSize - 2 * sizeof(size_t))
+                                 + ") is less than minSizeToDispatch (" + std::to_string(this->minSizeToDispatch - 2 * sizeof(size_t)) + ")");
     }
 
     if(neighbors.empty() and numReceiveBuffers == 0)
@@ -241,7 +244,24 @@ void BuffersManager<T>::Receive(bool ignore)
         if(not ignore)
         {
             size_t n;
+            size_t sequence;
             size_t bytes = serializer.extract(n, 0);
+            bytes += serializer.extract(sequence, bytes);
+            if(sequence != this->recvCounters[fromRank])
+            {
+                // Diagnostic for lost or reordered particle messages: the
+                // sender numbers messages per destination from zero.
+                int unexpectedQueued = 0;
+                MPI_Status probe;
+                MPI_Iprobe(fromRank, this->tag, this->comm, &unexpectedQueued, &probe);
+                int recvCount = 0;
+                MPI_Get_count(&status, MPI_BYTE, &recvCount);
+                std::cerr << "[BuffersManager] rank " << this->rank_world << " received message seq " << sequence
+                          << " from rank " << fromRank << " but expected seq " << this->recvCounters[fromRank]
+                          << " (payload_bytes=" << n << " message_bytes=" << recvCount
+                          << " tag=" << this->tag << " another_message_from_source_queued=" << unexpectedQueued
+                          << " receive_slot=" << requestIndex << " receive_buffer_bytes=" << serializer.size() << ")" << std::endl;
+            }
             data.clear();
             serializer.extract(data, bytes, n);
             this->receiveCallback(data.data(), data.size(), fromRank);
@@ -266,6 +286,7 @@ void BuffersManager<T>::Add(rank_t rank, const T &value)
             bufferIndex = this->buffers.size();
             Serializer &serializer = this->buffers.emplace_back();
             serializer.insert(static_cast<size_t>(0));
+            serializer.insert(static_cast<size_t>(0));
         }
         else
         {
@@ -274,6 +295,7 @@ void BuffersManager<T>::Add(rank_t rank, const T &value)
             this->availableBuffersIndices.erase(it2);
             Serializer &serializer = this->buffers[bufferIndex];
             serializer.reset();
+            serializer.insert(static_cast<size_t>(0));
             serializer.insert(static_cast<size_t>(0));
         }
     }
@@ -333,6 +355,7 @@ void BuffersManager<T>::Dispatch(rank_t rank)
 
     assert(this->buffers[bufferIndex].size() >= sizeof(size_t));
     assert(this->buffers[bufferIndex].size() <= this->buffersSize);
+    this->buffers[bufferIndex].hardSet(sizeof(size_t), static_cast<size_t>(this->sendCounters[rank]));
     MPI_Request &request = this->sendRequests.emplace_back(MPI_REQUEST_NULL);
     this->sendBuffersByRequests[this->sendRequests.size() - 1] = bufferIndex;
     MPI_Issend(this->buffers[bufferIndex].getData(), this->buffers[bufferIndex].size(), MPI_BYTE, rank, this->tag, this->comm, &request);
