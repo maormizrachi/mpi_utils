@@ -144,6 +144,10 @@ void BuffersManagerQueryAgent<QueryData, AnswerType>::answerQueries()
 template<typename QueryData, typename AnswerType>
 void BuffersManagerQueryAgent<QueryData, AnswerType>::sendQuery(const _queryInfo &query)
 {
+    if((this->size == 1) and (!this->sendToSelf))
+    {
+        return;
+    }
     typename TalkAgent<QueryData>::RanksSet talkingRanks = this->talkAgent->getTalkList(query.data);
     for(const int &_rank : talkingRanks)
     {
