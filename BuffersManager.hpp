@@ -12,6 +12,7 @@
 #include <boost/container/flat_map.hpp>
 #include "types.h"
 #include "serialize/Serializer.hpp"
+#include "BatchTrace.hpp"
 
 template<typename T>
 class BuffersManager
@@ -29,6 +30,21 @@ public:
 
     void Destroy(void);
 
+    // Destroy() in two local steps around its one collective, so several managers on the same communicator can share
+    // one counter reduction and one barrier (DestroyBuffersManagerPair). CompleteSends marks the manager destroyed and
+    // completes its sends; CloseReceives takes the number of messages sent to this rank (the reduce-scatter result).
+    void CompleteSends(void);
+
+    void CloseReceives(size_t sentToMe);
+
+    // Dispatches every non-empty pending send buffer now, in ascending rank order. Each buffer goes out as the same
+    // message a later ShouldSend() would have sent, provided nothing more is added to it in between.
+    void DispatchAll(void);
+
+    inline MPI_Comm GetComm() const{return this->comm;};
+
+    inline bool IsDestroyed() const{return this->destroyed;};
+
     inline size_t CountOutcoming() const{return this->sendRequests.size();};
 
     inline size_t GetPendingNumber() const{return this->ranksSendBuffers.size();};
@@ -45,9 +61,13 @@ public:
 
     inline size_t GetTotalMemoryBytes() const {return this->buffers.size() * this->buffersSize;};
 
+    // Diagnostics only: while Trace is non-null, dispatches (by reason), messages and bytes are counted into it.
+    inline void SetTrace(BuffersManagerTrace *Trace){this->TraceSink = Trace;};
+
 private:
     MPI_Comm comm;
     bool destroyed;
+    BuffersManagerTrace *TraceSink = nullptr;
     rank_t rank_world, size_world;
     std::vector<Serializer> buffers;
     std::vector<MPI_Request> sendRequests;
@@ -143,6 +163,19 @@ void BuffersManager<T>::Destroy(void)
     {
         return;
     }
+    this->CompleteSends();
+
+    size_t sentToMe = 0;
+    std::vector<int> counts(this->size_world, 1);
+    MPI_Reduce_scatter(this->sendCounters.data(), &sentToMe, counts.data(), MPI_UNSIGNED_LONG_LONG, MPI_SUM, this->comm);
+
+    this->CloseReceives(sentToMe);
+    MPI_Barrier(this->comm);
+}
+
+template<typename T>
+void BuffersManager<T>::CompleteSends(void)
+{
     this->destroyed = true;
     if(not this->sendRequests.empty())
     {
@@ -154,11 +187,11 @@ void BuffersManager<T>::Destroy(void)
     {
         throw std::runtime_error("BuffersManager: not all send requests were handled (active=" + std::to_string(this->activeSendRequests) + ")");
     }
+}
 
-    size_t sentToMe = 0;
-    std::vector<int> counts(this->size_world, 1);
-    MPI_Reduce_scatter(this->sendCounters.data(), &sentToMe, counts.data(), MPI_UNSIGNED_LONG_LONG, MPI_SUM, this->comm);
-
+template<typename T>
+void BuffersManager<T>::CloseReceives(size_t sentToMe)
+{
     if(sentToMe < this->recvCounter)
     {
         throw std::runtime_error("BuffersManager: too many receives handled (recv=" + std::to_string(this->recvCounter) + ", sentToMe=" + std::to_string(sentToMe) + ")");
@@ -184,6 +217,13 @@ void BuffersManager<T>::Destroy(void)
                 MPI_Request &request = this->receiveRequests[requestIndex];
                 this->recvCounter++;
                 this->recvCounters[fromRank]++;
+                if(this->TraceSink != nullptr)
+                {
+                    int ReceivedBytes = 0;
+                    MPI_Get_count(&array_of_statuses[i], MPI_BYTE, &ReceivedBytes); // local status query
+                    ++this->TraceSink->MessagesReceived;
+                    this->TraceSink->BytesReceived += static_cast<size_t>(ReceivedBytes);
+                }
                 if(this->recvCounter < sentToMe)
                 {
                     MPI_Irecv(serializer.getData(), serializer.size(), MPI_BYTE, this->receiveSources[requestIndex], this->tag, this->comm, &request);
@@ -207,7 +247,72 @@ void BuffersManager<T>::Destroy(void)
     {
         MPI_Waitall(this->receiveRequests.size(), this->receiveRequests.data(), MPI_STATUSES_IGNORE);
     }
-    MPI_Barrier(this->comm);
+}
+
+template<typename T>
+void BuffersManager<T>::DispatchAll(void)
+{
+    std::vector<rank_t> PendingRanks;
+    PendingRanks.reserve(this->ranksSendBuffers.size());
+    for(const auto &Pending : this->ranksSendBuffers)
+    {
+        size_t BufferBytes = 0;
+        this->buffers[Pending.second].extract(BufferBytes, 0);
+        if(BufferBytes != sizeof(size_t))
+        {
+            PendingRanks.push_back(Pending.first); // the same emptiness test as ShouldSend()
+        }
+    }
+    for(rank_t PendingRank : PendingRanks)
+    {
+        if(this->TraceSink != nullptr)
+        {
+            ++this->TraceSink->DispatchByFlush;
+        }
+        this->Dispatch(PendingRank);
+    }
+}
+
+/**
+ * Destroys two managers on the same communicator with one counter reduce-scatter instead of two and without the two
+ * per-manager barriers: the same local steps as First.Destroy() followed by Second.Destroy(), except that both sends
+ * are completed before the shared reduce-scatter. Each rank's two received-message totals are the same numbers the two
+ * separate reductions give. When FinalBarrier is false the caller must issue a barrier on the communicator before any
+ * rank reuses either tag (e.g. a following MPI_Barrier), which restores the guarantee Destroy()'s barrier gave.
+ */
+template<typename T1, typename T2>
+void DestroyBuffersManagerPair(BuffersManager<T1> &First, BuffersManager<T2> &Second, bool FinalBarrier = true)
+{
+    static_assert(sizeof(size_t) == sizeof(unsigned long long), "send counters are reduced as MPI_UNSIGNED_LONG_LONG");
+    if(First.IsDestroyed() or Second.IsDestroyed())
+    {
+        throw std::runtime_error("DestroyBuffersManagerPair: a manager was already destroyed");
+    }
+    const MPI_Comm Comm = First.GetComm();
+    int Size = 0;
+    MPI_Comm_size(Comm, &Size);
+
+    First.CompleteSends();
+    Second.CompleteSends();
+
+    const std::vector<size_t> &FirstCounters = First.GetAllSendCounters();
+    const std::vector<size_t> &SecondCounters = Second.GetAllSendCounters();
+    std::vector<size_t> InterleavedCounters(2 * static_cast<size_t>(Size));
+    for(int Rank = 0; Rank < Size; Rank++)
+    {
+        InterleavedCounters[2 * Rank] = FirstCounters[Rank];
+        InterleavedCounters[2 * Rank + 1] = SecondCounters[Rank];
+    }
+    size_t SentToMe[2] = {0, 0};
+    std::vector<int> RecvCounts(Size, 2);
+    MPI_Reduce_scatter(InterleavedCounters.data(), SentToMe, RecvCounts.data(), MPI_UNSIGNED_LONG_LONG, MPI_SUM, Comm);
+
+    First.CloseReceives(SentToMe[0]);
+    Second.CloseReceives(SentToMe[1]);
+    if(FinalBarrier)
+    {
+        MPI_Barrier(Comm);
+    }
 }
 
 template<typename T>
@@ -250,6 +355,13 @@ void BuffersManager<T>::Receive(bool ignore)
         this->recvBuffersByRequests[requestIndex] = bufferIndex;
         this->recvCounter++;
         this->recvCounters[fromRank]++;
+        if(this->TraceSink != nullptr)
+        {
+            int ReceivedBytes = 0;
+            MPI_Get_count(&status, MPI_BYTE, &ReceivedBytes); // local status query
+            ++this->TraceSink->MessagesReceived;
+            this->TraceSink->BytesReceived += static_cast<size_t>(ReceivedBytes);
+        }
         MPI_Irecv(serializer.getData(), serializer.size(), MPI_BYTE, this->receiveSources[requestIndex], this->tag, this->comm, &request);
     }
 }
@@ -315,10 +427,18 @@ bool BuffersManager<T>::ShouldSend(rank_t rank)
     }
     if(bufferSize >= this->minSizeToDispatch)
     {
+        if(this->TraceSink != nullptr)
+        {
+            ++this->TraceSink->DispatchBySize; // every true return is followed by Dispatch(rank)
+        }
         return true;
     }
     if(this->buffersToCycles[rank] >= this->minCyclesToDispatch)
     {
+        if(this->TraceSink != nullptr)
+        {
+            ++this->TraceSink->DispatchByTimer;
+        }
         return true;
     }
     this->buffersToCycles[rank] += 1;
@@ -333,6 +453,11 @@ void BuffersManager<T>::Dispatch(rank_t rank)
 
     assert(this->buffers[bufferIndex].size() >= sizeof(size_t));
     assert(this->buffers[bufferIndex].size() <= this->buffersSize);
+    if(this->TraceSink != nullptr)
+    {
+        ++this->TraceSink->MessagesSent;
+        this->TraceSink->BytesSent += this->buffers[bufferIndex].size();
+    }
     MPI_Request &request = this->sendRequests.emplace_back(MPI_REQUEST_NULL);
     this->sendBuffersByRequests[this->sendRequests.size() - 1] = bufferIndex;
     MPI_Issend(this->buffers[bufferIndex].getData(), this->buffers[bufferIndex].size(), MPI_BYTE, rank, this->tag, this->comm, &request);

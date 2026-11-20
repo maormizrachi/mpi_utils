@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <chrono>
 #include <vector>
 #include <mpi.h>
 #include "serialize/Serializer.hpp"
@@ -10,8 +11,11 @@
 
 #define MPI_EXCHANGE_TAG 5
 
+// BarrierWaitSeconds (diagnostics only): when non-null, the wall seconds of the closing MPI_Barrier are added to it.
+// The barrier itself is the same either way.
 template<typename T, typename Index_T = size_t>
-std::vector<std::vector<T>> MPI_exchange_data_indexed(const std::vector<rank_t> &correspondents, const std::vector<T> &data, const std::vector<std::vector<Index_T>> &indices = std::vector<std::vector<Index_T>>(), const size_t &extent = 1)
+std::vector<std::vector<T>> MPI_exchange_data_indexed(const std::vector<rank_t> &correspondents, const std::vector<T> &data, const std::vector<std::vector<Index_T>> &indices = std::vector<std::vector<Index_T>>(), const size_t &extent = 1,
+    double *BarrierWaitSeconds = nullptr)
 {
 	std::vector<MPI_Request> req(correspondents.size());
 	std::vector<Serializer> senders(correspondents.size());
@@ -49,7 +53,16 @@ std::vector<std::vector<T>> MPI_exchange_data_indexed(const std::vector<rank_t> 
 	{
 		MPI_Waitall(static_cast<int>(correspondents.size()), &req[0], MPI_STATUSES_IGNORE);
 	}
-	MPI_Barrier(MPI_COMM_WORLD);
+    if(BarrierWaitSeconds != nullptr)
+    {
+        const std::chrono::steady_clock::time_point BarrierStart = std::chrono::steady_clock::now();
+        MPI_Barrier(MPI_COMM_WORLD);
+        *BarrierWaitSeconds += std::chrono::duration<double>(std::chrono::steady_clock::now() - BarrierStart).count();
+    }
+    else
+    {
+        MPI_Barrier(MPI_COMM_WORLD);
+    }
 	return result;
 }
 

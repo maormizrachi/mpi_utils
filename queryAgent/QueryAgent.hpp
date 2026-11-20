@@ -7,6 +7,7 @@
 #include "AnswerAgent.hpp"
 #include "TalkAgent.hpp"
 #include "QueryData.hpp"
+#include <mpi_utils/BatchTrace.hpp>
 
 template<typename QueryData, typename AnswerType>
 class QueryAgent
@@ -21,6 +22,10 @@ public:
     virtual std::vector<std::vector<size_t>> &getRecvData() = 0;
     
     virtual std::vector<int> &getRecvProc() = 0;
+
+    // Diagnostics only: while Trace is non-null, runBatch writes its per-rank counters and timers into it (reset at the
+    // start of every batch). Agents without instrumentation ignore it.
+    virtual void SetBatchTrace(QueryBatchTrace *Trace) {(void)Trace;}
 
 protected:
     MPI_Comm comm;

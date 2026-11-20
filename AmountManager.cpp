@@ -74,6 +74,15 @@ void AmountManager::Initialize(counter_t num)
     MPI_Reduce(&num, &this->globalNum, 1, MPI_LONG_LONG, MPI_SUM, 0, this->comm);
 }
 
+void AmountManager::InitializeUniform(counter_t NumPerRank)
+{
+    // Initialize's MPI_Reduce writes only the root's globalNum, with the sum over ranks; non-root ranks keep 0.
+    if(this->rank == 0)
+    {
+        this->globalNum = NumPerRank * static_cast<counter_t>(this->size);
+    }
+}
+
 void AmountManager::Increase(counter_t n)
 {
     this->tempNum += n;

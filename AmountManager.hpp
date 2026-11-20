@@ -18,6 +18,10 @@ public:
     
     void Initialize(counter_t num);
 
+    // Same result as Initialize(NumPerRank) called on every rank with the same value, without the reduction: the
+    // root's total is NumPerRank * size. Only valid when every rank of the communicator passes the same value.
+    void InitializeUniform(counter_t NumPerRank);
+
     void Increase(counter_t n);
 
     inline void Decrease(counter_t n){this->Increase(-n);};
